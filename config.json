@@ -1,0 +1,11 @@
+config_example = {
+    "ssh_host": "your.server.com",
+    "ssh_port": 22,
+    "ssh_user": "audit_user",
+    "ssh_key_file": "/path/to/private_key",
+    "remote_path": "/var/printer_data",
+    "local_download_path": "./downloads",
+    "decrypt_temp_path": "./decrypted",
+    "output_path": "./output_pdfs",
+    "fernet_key": "your-fernet-key-here"
+}
