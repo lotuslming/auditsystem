@@ -188,64 +188,79 @@ class PrinterAuditSync:
     
     def parse_filename(self, filename):
         """
-        解析文件名：*_ctrl__job任务序号_子任务序号-操作类型
-        示例：printer_ctrl__job123_001-print.dat
+        解析文件名：*wp打印机标识_ctrl_job任务序号_子任务序号-操作类型
+        例如：datawp001_ctrl_job12345_001-print.dat
         """
         try:
-            # 去除文件扩展名
-            name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
+            # 移除文件扩展名
+            name_without_ext = filename.rsplit('.', 1)[0]
             
-            # 查找 ctrl__ 的位置
-            ctrl_pos = name_without_ext.find('_ctrl__')
-            if ctrl_pos == -1:
+            # 分割文件名
+            parts = name_without_ext.split('_')
+            
+            if len(parts) < 4:
                 return None
             
-            # 提取前缀
-            prefix = name_without_ext[:ctrl_pos]
+            # 查找wp打印机标识的位置
+            printer_id = None
+            ctrl_index = -1
             
-            # 提取 ctrl__ 之后的部分
-            after_ctrl = name_without_ext[ctrl_pos + 7:]  # 7 = len('_ctrl__')
+            for i, part in enumerate(parts):
+                if 'wp' in part.lower():
+                    printer_id = part
+                if part == 'ctrl':
+                    ctrl_index = i
+                    break
             
-            # 分割为：job任务序号_子任务序号-操作类型
-            parts = after_ctrl.split('_', 1)
-            if len(parts) < 2:
+            if not printer_id or ctrl_index == -1:
                 return None
             
-            # 解析 job任务序号
-            job_part = parts[0]
+            # 获取job任务序号
+            job_part = parts[ctrl_index + 1]
             if not job_part.startswith('job'):
                 return None
-            job_id = job_part[3:]  # 去掉 'job' 前缀
+            job_id = job_part.replace('job', '')
             
-            # 解析 子任务序号-操作类型
-            subtask_operation = parts[1]
-            if '-' not in subtask_operation:
+            # 获取子任务序号和操作类型
+            last_part = parts[ctrl_index + 2]
+            if '-' not in last_part:
                 return None
             
-            subtask_str, operation = subtask_operation.split('-', 1)
+            subtask_str, operation = last_part.split('-', 1)
+            subtask = int(subtask_str)
+            
+            # 获取前缀（wp之前的部分）
+            prefix_parts = []
+            for i, part in enumerate(parts):
+                if part == printer_id:
+                    break
+                prefix_parts.append(part)
+            prefix = '_'.join(prefix_parts) if prefix_parts else ''
             
             return {
                 'prefix': prefix,
+                'printer_id': printer_id,
                 'job_id': job_id,
                 'operation': operation,
-                'subtask': int(subtask_str),
+                'subtask': subtask,
                 'filename': filename
             }
+            
         except Exception as e:
             print(f"解析文件名失败 {filename}: {e}")
             return None
     
     def merge_job_files(self):
-        """合并同任务的数据文件"""
+        """按打印机和任务合并数据文件"""
         print("开始合并任务文件...")
         
-        # 按任务分组
+        # 按打印机+任务分组
         jobs = defaultdict(list)
         for filename in os.listdir(self.decrypt_temp_path):
             parsed = self.parse_filename(filename)
             if parsed:
-                # 使用新格式的key：prefix_ctrl__job任务序号_操作类型
-                job_key = f"{parsed['prefix']}_ctrl__job{parsed['job_id']}_{parsed['operation']}"
+                # 按打印机+任务序号+操作类型分组
+                job_key = f"{parsed['printer_id']}_job{parsed['job_id']}_{parsed['operation']}"
                 jobs[job_key].append(parsed)
         
         merged_files = []
@@ -261,7 +276,7 @@ class PrinterAuditSync:
             upload_datetime = datetime.utcfromtimestamp(upload_time_utc) + timedelta(hours=8)
             time_str = upload_datetime.strftime('%Y%m%d_%H%M%S')
             
-            # 合并文件，新命名格式：prefix_ctrl__job任务序号_操作类型_时间
+            # 合并文件，文件名格式：打印机标识_job任务序号_操作类型_时间
             merged_filename = f"{job_key}_{time_str}"
             merged_file = self.decrypt_temp_path / merged_filename
             
@@ -272,7 +287,7 @@ class PrinterAuditSync:
                         outfile.write(infile.read())
             
             merged_files.append(merged_filename)
-            print(f"已合并任务: {job_key} ({len(file_list)}个子任务) -> {merged_filename}")
+            print(f"已合并任务 [{file_list[0]['printer_id']}]: {job_key} ({len(file_list)}个子任务) -> {merged_filename}")
         
         return merged_files
     
@@ -281,6 +296,108 @@ class PrinterAuditSync:
         print("开始转换为PDF...")
         
         for filename in unirast_files:
+            input_file = self.decrypt_temp_path / filename
+            output_file = self.output_path / f"{filename}.pdf"
+            
+            try:
+                # 方法1: 使用rasterview (需要安装cups-filters)
+                cmd = [
+                    'rasterview',
+                    '-o', str(output_file),
+                    str(input_file)
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    print(f"✓ 已转换: {filename} -> {filename}.pdf")
+                else:
+                    # 方法2: 尝试使用gstoraster的逆向工具
+                    print(f"rasterview转换失败，尝试其他方法...")
+                    self.convert_unirast_alternative(input_file, output_file)
+                    
+            except FileNotFoundError:
+                print(f"⚠ rasterview未安装，尝试替代方法...")
+                self.convert_unirast_alternative(input_file, output_file)
+            except Exception as e:
+                print(f"✗ 转换失败 {filename}: {e}")
+    
+    def convert_unirast_alternative(self, input_file, output_file):
+        """使用替代方法转换unirast"""
+        try:
+            # 尝试使用cups-raster工具
+            cmd = [
+                'rastertopdf',
+                str(input_file),
+                '1',  # job-id
+                'user',  # user
+                'title',  # title
+                '1',  # copies
+                ''  # options
+            ]
+            
+            with open(output_file, 'wb') as f:
+                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+            
+            if result.returncode == 0:
+                print(f"✓ 已转换 (rastertopdf): {output_file.name}")
+            else:
+                print(f"✗ 转换失败: {result.stderr.decode()}")
+                
+        except Exception as e:
+            print(f"✗ 替代转换方法失败: {e}")
+            print("提示：请安装 cups-filters 包")
+    
+    def run(self):
+        """运行完整流程"""
+        print("=" * 60)
+        print("打印机审计数据同步系统启动")
+        print("=" * 60)
+        
+        # 1. 从服务端同步数据
+        new_files = self.sync_from_server()
+        
+        if not new_files:
+            print("没有新文件需要处理")
+            return
+        
+        # 2. 解密文件
+        decrypted_files = self.decrypt_files(new_files)
+        
+        if not decrypted_files:
+            print("没有成功解密的文件")
+            return
+        
+        # 3. 等待数据稳定
+        self.wait_for_stable(120)
+        
+        # 4. 按打印机合并同任务文件并重命名
+        merged_files = self.merge_job_files()
+        
+        if not merged_files:
+            print("没有可合并的任务文件")
+            return
+        
+        # 5. 转换为PDF
+        self.convert_to_pdf(merged_files)
+        
+        print("=" * 60)
+        print(f"处理完成！共处理 {len(merged_files)} 个打印任务")
+        print(f"输出目录: {self.output_path}")
+        print("=" * 60)
+
+
+if __name__ == '__main__':
+    try:
+        sync_system = PrinterAuditSync()
+        sync_system.run()
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+    except Exception as e:
+        print(f"程序运行出错: {e}")
+        import traceback
+        traceback.print_exc()
+nirast_files:
             input_file = self.decrypt_temp_path / filename
             output_file = self.output_path / f"{filename}.pdf"
             
